@@ -39,7 +39,15 @@ ISSUE_TYPES = {
     "cease_desist":     "Cease and desist (harassment, IP, debt)",
     "contract_dispute": "Contract breach / demand",
     "consumer":         "Consumer protection / defective product / fraud",
+    "bankruptcy":       "Bankruptcy filing (Chapter 7, 11, or 13)",
     "other":            "Other legal matter",
+}
+
+# Sub-types for bankruptcy. Keyed by the classifier label returned by the fleet.
+BANKRUPTCY_SUBTYPES = {
+    "chapter_7":  "Chapter 7 liquidation bankruptcy",
+    "chapter_13": "Chapter 13 wage-earner repayment plan",
+    "chapter_11": "Chapter 11 business reorganization",
 }
 
 ISSUE_TEMPLATES = {
@@ -50,6 +58,8 @@ ISSUE_TEMPLATES = {
     "cease_desist":     ["cease_desist"],
     "contract_dispute": ["small_claims_demand"],
     "consumer":         ["cease_desist"],
+    # Bankruptcy templates are placeholder keys — full templates in progress.
+    "bankruptcy":       ["chapter_13_plan_summary"],
     "other":            [],
 }
 
@@ -68,6 +78,8 @@ REQUIRED_FACTS = {
                          "recipient_address","amount_owed","reason","jurisdiction"],
     "consumer":         ["sender_name","sender_address","recipient_name",
                          "recipient_address","conduct_description","demand_description"],
+    "bankruptcy":       ["debtor_name","debtor_address","jurisdiction",
+                         "total_debt","monthly_income","bankruptcy_chapter"],
     "other":            [],
 }
 
@@ -101,13 +113,32 @@ def _now(): return datetime.now().isoformat() + "Z"
 def _make_id(s): return hashlib.sha1(f"{s}:{time.time()}".encode()).hexdigest()[:12]
 def _rd(r): return dict(r)
 
-def create_session(user_name: str) -> dict:
+def create_session(user_name: str, context: dict = None) -> dict:
+    """Create a new Gazelle session.
+
+    Args:
+        user_name: Display name for the session owner.
+        context: Optional dict with Willow-supplied background info.
+                 Expected keys:
+                   - facts (list[str]): pre-known fact strings
+                   - source_files (list[str]): filenames that contributed the facts
+                 Stored internally under the reserved key ``_willow_context``
+                 inside facts_json so it survives DB round-trips without a
+                 schema migration.
+    """
     sid = _make_id(user_name); now = _now()
+    initial_facts: dict = {}
+    if context and isinstance(context, dict):
+        initial_facts["_willow_context"] = {
+            "facts":        context.get("facts") or [],
+            "source_files": context.get("source_files") or [],
+        }
     with _get_conn() as c:
         c.execute("INSERT INTO gazelle_sessions "
                   "(id,user_name,issue_raw,issue_type,jurisdiction,facts_json,status,consent_given,created_at,updated_at)"
                   " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                  (sid,user_name,None,None,None,"{}","intake",0,now,now))
+                  (sid, user_name, None, None, None,
+                   json.dumps(initial_facts), "intake", 0, now, now))
     return get_session(sid)
 
 def get_session(session_id: str) -> Optional[dict]:
@@ -115,14 +146,31 @@ def get_session(session_id: str) -> Optional[dict]:
         row = c.execute("SELECT * FROM gazelle_sessions WHERE id=?",(session_id,)).fetchone()
     if not row: return None
     d = _rd(row)
-    try: d["facts"] = json.loads(d.get("facts_json") or "{}")
-    except: d["facts"] = {}
+    try:
+        raw = json.loads(d.get("facts_json") or "{}")
+    except:
+        raw = {}
+    # Surface willow_context as a top-level key on the session dict.
+    d["willow_context"] = raw.pop("_willow_context", None)
+    d["facts"] = raw
     return d
 
 def _upd(session_id: str, **kw):
     if not kw: return
     kw["updated_at"] = _now()
-    if "facts" in kw: kw["facts_json"] = json.dumps(kw.pop("facts"))
+    if "facts" in kw:
+        # Re-merge with any stored willow_context so it is not lost on update.
+        existing_raw = {}
+        try:
+            with _get_conn() as c:
+                row = c.execute("SELECT facts_json FROM gazelle_sessions WHERE id=?",
+                                (session_id,)).fetchone()
+            if row:
+                existing_raw = json.loads(row["facts_json"] or "{}")
+        except:
+            pass
+        merged = {**existing_raw, **kw.pop("facts")}
+        kw["facts_json"] = json.dumps(merged)
     sql = "UPDATE gazelle_sessions SET " + ", ".join(f"{k}=?" for k in kw) + " WHERE id=?"
     with _get_conn() as c: c.execute(sql, list(kw.values()) + [session_id])
 
@@ -150,13 +198,27 @@ def get_messages(session_id: str, limit: int = 50) -> list:
     return msgs
 
 def classify_issue(session_id: str, user_description: str) -> dict:
+    """Classify the user's legal issue.
+
+    Adds "bankruptcy" to recognized types.  When the fleet (or fallback)
+    returns issue_type == "bankruptcy", the classifier also attempts to
+    identify which chapter (chapter_7 / chapter_13 / chapter_11) and
+    returns it as ``bankruptcy_subtype``.
+    """
     il = "\n".join(f"  {k}: {v}" for k,v in ISSUE_TYPES.items())
+    # Include bankruptcy sub-types in the prompt so the fleet can signal them.
+    bk_hint = ("When issue_type is 'bankruptcy', also include a "
+                "'bankruptcy_subtype' key with one of: "
+                + ", ".join(BANKRUPTCY_SUBTYPES.keys()) + ".")
     prompt = ("You are a legal intake classifier.\n\nSituation:\n---\n" + user_description +
               "\n---\n\nIssue types:\n" + il +
-              '\n\nRespond ONLY with JSON: {"issue_type":"<key>","jurisdiction":"<state or federal>",' +
+              '\n\n' + bk_hint +
+              '\n\nRespond ONLY with JSON: {"issue_type":"<key>","bankruptcy_subtype":"<sub or null>",'
+              '"jurisdiction":"<state or federal>",'
               '"confidence":0.0,"clarifying_questions":["q1","q2","q3"]}')
     raw = _ask_fleet(prompt, "")
-    result = {"issue_type":"other","jurisdiction":"federal","confidence":0.5,
+    result = {"issue_type":"other","bankruptcy_subtype":None,
+              "jurisdiction":"federal","confidence":0.5,
               "clarifying_questions":["What state?","Names of all parties?","Desired outcome?"]}
     if raw:
         clean = raw.strip()
@@ -168,7 +230,13 @@ def classify_issue(session_id: str, user_description: str) -> dict:
             if p.get("issue_type") in ISSUE_TYPES: result["issue_type"] = p["issue_type"]
             result["jurisdiction"] = p.get("jurisdiction","federal") or "federal"
             result["confidence"] = float(p.get("confidence",0.5))
-            if isinstance(p.get("clarifying_questions"),list): result["clarifying_questions"] = p["clarifying_questions"][:5]
+            if isinstance(p.get("clarifying_questions"),list):
+                result["clarifying_questions"] = p["clarifying_questions"][:5]
+            # Bankruptcy sub-type — only trust it when issue is bankruptcy.
+            if result["issue_type"] == "bankruptcy":
+                sub = p.get("bankruptcy_subtype") or ""
+                if sub in BANKRUPTCY_SUBTYPES:
+                    result["bankruptcy_subtype"] = sub
         except: pass
     _upd(session_id, issue_raw=user_description, issue_type=result["issue_type"],
          jurisdiction=result["jurisdiction"], status="clarifying")
@@ -195,8 +263,24 @@ def extract_facts(session_id: str, conversation_text: str) -> dict:
     _upd(session_id, facts=merged)
     return {"facts":merged,"missing_fields":missing,"complete":len(missing)==0}
 
-def get_required_templates(issue_type: str) -> list:
-    return ISSUE_TEMPLATES.get(issue_type,[])
+def get_required_templates(issue_type: str, bankruptcy_subtype: str = None) -> list:
+    """Return the list of template keys required for the given issue type.
+
+    For bankruptcy, Chapter 13 specifically returns the Chapter 13 plan
+    summary plus a schedule recap placeholder.  All other bankruptcy
+    sub-types (and the generic bankruptcy case) return the base placeholder.
+
+    Note: Full Chapter 13 templates are in progress. The keys
+    ``chapter_13_plan_summary`` and ``schedule_recap`` are placeholders
+    and will resolve to actual templates once they are authored.
+    """
+    if issue_type == "bankruptcy":
+        if bankruptcy_subtype == "chapter_13":
+            # Chapter 13-specific placeholders — full templates in progress.
+            return ["chapter_13_plan_summary", "schedule_recap"]
+        # chapter_7 / chapter_11 / unspecified — base placeholder only.
+        return ISSUE_TEMPLATES.get("bankruptcy", ["chapter_13_plan_summary"])
+    return ISSUE_TEMPLATES.get(issue_type, [])
 
 _DISC = ("This document was prepared with AI assistance. "
          "Review with a qualified attorney before submission.")
@@ -308,7 +392,16 @@ _TB = {
 
 def fill_document(session_id: str, template_key: str, facts: dict) -> dict:
     b = _TB.get(template_key)
-    if not b: return {"error": f"Unknown template: {template_key}"}
+    if not b:
+        # Placeholder template keys (e.g. bankruptcy) have no renderer yet.
+        # Return a stub so callers know the document is pending.
+        return {
+            "doc_id": None,
+            "title": template_key.replace("_", " ").title() + " (Template In Progress)",
+            "content": "",
+            "status": "placeholder",
+            "note": f"Template '{template_key}' is not yet authored. Full templates are in progress.",
+        }
     title, html = b(facts)
     with _get_conn() as c:
         cur = c.execute("INSERT INTO gazelle_documents (session_id,doc_type,doc_title,content,status,created_at) VALUES (?,?,?,?,'draft',?)",
@@ -358,7 +451,42 @@ _ML = {
     "employee_address":"your mailing address","agency_name":"the agency's name",
     "description_of_records":"what records you want","conduct_description":"what conduct to stop",
     "demand_description":"what you want them to do",
+    "debtor_name":"your full legal name","debtor_address":"your mailing address",
+    "total_debt":"the total amount of debt","monthly_income":"your monthly income",
+    "bankruptcy_chapter":"which bankruptcy chapter (7, 11, or 13)",
 }
+
+def _build_willow_context_intro(willow_context: dict) -> str:
+    """Build an acknowledgment string from Willow-supplied context facts.
+
+    Returns an empty string if there are no facts to surface.
+    """
+    if not willow_context or not isinstance(willow_context, dict):
+        return ""
+    facts = willow_context.get("facts") or []
+    if not facts:
+        return ""
+
+    # Summarize facts: show up to 3, then indicate if there are more.
+    shown = facts[:3]
+    remainder = len(facts) - len(shown)
+    facts_text = "; ".join(shown)
+    if remainder > 0:
+        facts_text += f" (and {remainder} more)"
+
+    # Infer a topic from the facts using a simple heuristic: take the first fact.
+    first_fact = shown[0] if shown else ""
+    # Try to identify a rough topic keyword from the first fact.
+    topic = first_fact[:80].rstrip(".").rstrip(",") if first_fact else "your situation"
+
+    intro = (
+        "I can see some background information from your files: "
+        + facts_text
+        + ". Let me confirm \u2014 is this related to "
+        + topic
+        + "?"
+    )
+    return intro
 
 def process_message(session_id: str, user_message: str) -> dict:
     s = get_session(session_id)
@@ -376,8 +504,24 @@ def process_message(session_id: str, user_message: str) -> dict:
         if law["results"]:
             top = law["results"][0]; sm=(top.get("summary") or "")[:200]
             ln = "\n\nRelevant law: **"+top["title"]+"**"+((" \u2014 "+sm) if sm else "")
-        resp = ("I understand \u2014 it sounds like you have a **"+ISSUE_TYPES.get(it,it)+"** situation."+ln+
-                "\n\nTo prepare your documents I need a few details:\n\n"+qt+"\n\nAnswer as many as you can.")
+
+        # Check for Willow-supplied context facts and prepend an acknowledgment
+        # instead of a cold generic intro when background is available.
+        willow_context = s.get("willow_context")
+        context_intro = _build_willow_context_intro(willow_context)
+
+        if context_intro:
+            resp = (context_intro +
+                    "\n\nBased on what you've described, it sounds like a **"
+                    + ISSUE_TYPES.get(it, it) + "** situation." + ln +
+                    "\n\nTo prepare your documents I need a few details:\n\n" + qt +
+                    "\n\nAnswer as many as you can.")
+        else:
+            resp = ("I understand \u2014 it sounds like you have a **" + ISSUE_TYPES.get(it,it) +
+                    "** situation." + ln +
+                    "\n\nTo prepare your documents I need a few details:\n\n" + qt +
+                    "\n\nAnswer as many as you can.")
+
         add_message(session_id,"gazelle",resp)
         return {"response":resp,"status":"clarifying","documents_ready":False,"documents":[]}
 
@@ -395,7 +539,9 @@ def process_message(session_id: str, user_message: str) -> dict:
         s = get_session(session_id); facts = s.get("facts") or {}
         facts["date"] = datetime.now().strftime("%B %d, %Y")
         it = s.get("issue_type") or "other"
-        docs = [fill_document(session_id,t,facts) for t in get_required_templates(it)]
+        # Pass bankruptcy_subtype through to get_required_templates when relevant.
+        bk_sub = facts.get("bankruptcy_chapter") if it == "bankruptcy" else None
+        docs = [fill_document(session_id,t,facts) for t in get_required_templates(it, bk_sub)]
         _upd(session_id,status="complete")
         if docs:
             names = ", ".join(d["title"] for d in docs)
@@ -413,7 +559,9 @@ def process_message(session_id: str, user_message: str) -> dict:
         ext = extract_facts(session_id,conv)
         facts = ext.get("facts") or s.get("facts") or {}
         facts["date"] = datetime.now().strftime("%B %d, %Y")
-        it = s.get("issue_type") or "other"; tmps = get_required_templates(it)
+        it = s.get("issue_type") or "other"
+        bk_sub = facts.get("bankruptcy_chapter") if it == "bankruptcy" else None
+        tmps = get_required_templates(it, bk_sub)
         if tmps:
             with _get_conn() as c: c.execute("DELETE FROM gazelle_documents WHERE session_id=?",(session_id,))
             docs = [fill_document(session_id,t,facts) for t in tmps]
