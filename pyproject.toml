@@ -1,0 +1,5 @@
+[project]
+name = "safe-app-law-gazelle"
+version = "1.0.0"
+description = "Legal reference tool — statute search, case summaries, plain-language explainers from verified sources."
+requires-python = ">=3.10"
