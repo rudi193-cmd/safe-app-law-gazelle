@@ -5,10 +5,17 @@ Full-cycle legal assistant: classify issue, extract facts, look up statutes,
 fill document templates, return ready-to-print HTML.
 """
 from __future__ import annotations
-import hashlib, json, sqlite3, time, urllib.request, urllib.parse
+import hashlib, json, sys, time, urllib.request, urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+# Ensure repo root is on path so core.db is importable
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from core.db import get_connection
 
 _fleet_loaded = False
 
@@ -83,7 +90,6 @@ REQUIRED_FACTS = {
     "other":            [],
 }
 
-DB_PATH = Path(__file__).parent / "gazelle.db"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS gazelle_sessions (
     id TEXT PRIMARY KEY, user_name TEXT, issue_raw TEXT, issue_type TEXT,
@@ -91,19 +97,20 @@ CREATE TABLE IF NOT EXISTS gazelle_sessions (
     consent_given INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS gazelle_messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT,
+    id INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY, session_id TEXT, role TEXT,
     content TEXT, metadata_json TEXT DEFAULT \'{}\', timestamp TEXT
 );
 CREATE TABLE IF NOT EXISTS gazelle_documents (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, doc_type TEXT,
+    id INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY, session_id TEXT, doc_type TEXT,
     doc_title TEXT, content TEXT, status TEXT DEFAULT \'draft\', created_at TEXT
 );
 """
 
 def _get_conn():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(str(DB_PATH)); c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL;"); return c
+    import sqlite3 as _sqlite3
+    c = get_connection()
+    c.row_factory = _sqlite3.Row
+    return c
 
 def _ensure_schema():
     with _get_conn() as c: c.executescript(_SCHEMA)
