@@ -71,3 +71,43 @@ class SAFESession:
         self.consent_given = False
         self.session_id = None
         return {"status": "revoked", "message": "All Law Gazelle data has been deleted."}
+
+
+# ── Willow Consent Helpers ────────────────────────────────────────────────────
+
+def get_consent_status(token=None):
+    """Check if this app has consent to contribute to the user's Willow."""
+    try:
+        import requests as _r
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        resp = _r.get(f"{WILLOW_URL}/api/apps", headers=headers, timeout=10)
+        apps = resp.json().get("apps", [])
+        return next((a["consented"] for a in apps if a["app_id"] == APP_ID), False)
+    except Exception:
+        return False
+
+
+def request_consent_url():
+    """Return the Willow URL where the user can grant consent to this app."""
+    return f"{WILLOW_URL}/apps?highlight={APP_ID}"
+
+
+
+def send(to_app, subject, body, thread_id=None):
+    """Send a message to another app's Pigeon inbox."""
+    return _drop("send", {"to": to_app, "subject": subject, "body": body, "thread_id": thread_id})
+
+
+def check_inbox(unread_only=True):
+    """Fetch this app's Pigeon inbox from Willow."""
+    try:
+        import requests as _r
+        r = _r.get(
+            f"{WILLOW_URL}/api/pigeon/inbox",
+            params={"app_id": APP_ID, "unread_only": str(unread_only).lower()},
+            timeout=10
+        )
+        return r.json().get("messages", []) if r.ok else []
+    except Exception:
+        return []
+

@@ -113,9 +113,19 @@ def _get_conn():
     return c
 
 def _ensure_schema():
-    with _get_conn() as c: c.executescript(_SCHEMA)
+    with _get_conn() as c:
+        for stmt in _SCHEMA.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                try:
+                    c.execute(stmt)
+                except Exception:
+                    pass
 
-_ensure_schema()
+try:
+    _ensure_schema()
+except Exception:
+    pass
 def _now(): return datetime.now().isoformat() + "Z"
 def _make_id(s): return hashlib.sha1(f"{s}:{time.time()}".encode()).hexdigest()[:12]
 def _rd(r): return dict(r)
@@ -582,3 +592,144 @@ def process_message(session_id: str, user_message: str) -> dict:
     resp = "Tell me about your legal situation and I'll help you prepare documents."
     add_message(session_id,"gazelle",resp)
     return {"response":resp,"status":status,"documents_ready":False,"documents":[]}
+
+
+# ── Case Management ──────────────────────────────────────────────────────────
+
+def get_cases(username: str) -> list:
+    """All open cases for a user, with next deadline."""
+    with _get_conn() as c:
+        rows = c.execute(
+            "SELECT gc.*, "
+            "(SELECT MIN(gd.deadline_date) FROM sweet_pea_rudi19.gazelle_deadlines gd "
+            " WHERE gd.case_id = gc.id AND gd.status = 'pending') as next_deadline, "
+            "(SELECT COUNT(*) FROM sweet_pea_rudi19.gazelle_case_documents gcd "
+            " WHERE gcd.case_id = gc.id AND gcd.action_required = 1 "
+            " AND gcd.status = 'unreviewed') as action_count "
+            "FROM sweet_pea_rudi19.gazelle_cases gc "
+            "WHERE gc.username = ? ORDER BY gc.status ASC, gc.created_at DESC",
+            (username,)
+        ).fetchall()
+    result = []
+    for r in rows:
+        d = _rd(r)
+        try: d["parties"] = json.loads(d.get("parties_json") or "{}")
+        except: d["parties"] = {}
+        result.append(d)
+    return result
+
+
+def get_case(case_id: int, username: str) -> dict | None:
+    """Single case with full detail."""
+    with _get_conn() as c:
+        row = c.execute(
+            "SELECT * FROM sweet_pea_rudi19.gazelle_cases "
+            "WHERE id = ? AND username = ?", (case_id, username)
+        ).fetchone()
+    if not row: return None
+    d = _rd(row)
+    try: d["parties"] = json.loads(d.get("parties_json") or "{}")
+    except: d["parties"] = {}
+    d["documents"] = get_case_documents(case_id, username)
+    d["deadlines"] = get_case_deadlines(case_id, username)
+    return d
+
+
+def get_case_documents(case_id: int, username: str, doc_type: str = None) -> list:
+    """Documents for a case, optionally filtered by type."""
+    with _get_conn() as c:
+        if doc_type:
+            rows = c.execute(
+                "SELECT * FROM sweet_pea_rudi19.gazelle_case_documents "
+                "WHERE case_id = ? AND username = ? AND doc_type = ? "
+                "ORDER BY created_at DESC", (case_id, username, doc_type)
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM sweet_pea_rudi19.gazelle_case_documents "
+                "WHERE case_id = ? AND username = ? ORDER BY created_at DESC",
+                (case_id, username)
+            ).fetchall()
+    return [_rd(r) for r in rows]
+
+
+def get_case_deadlines(case_id: int, username: str, status: str = None) -> list:
+    """Deadlines for a case, optionally filtered by status."""
+    with _get_conn() as c:
+        if status:
+            rows = c.execute(
+                "SELECT * FROM sweet_pea_rudi19.gazelle_deadlines "
+                "WHERE case_id = ? AND username = ? AND status = ? "
+                "ORDER BY deadline_date ASC", (case_id, username, status)
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM sweet_pea_rudi19.gazelle_deadlines "
+                "WHERE case_id = ? AND username = ? ORDER BY deadline_date ASC",
+                (case_id, username)
+            ).fetchall()
+    return [_rd(r) for r in rows]
+
+
+def add_case_document(case_id: int, username: str, doc_type: str, title: str,
+                       content_text: str, source: str = "manual", **kwargs) -> dict:
+    """Insert a document and auto-extract deadlines if ECF."""
+    now = _now()
+    parsed_summary = kwargs.get("parsed_summary", "")
+    action_required = kwargs.get("action_required", 0)
+    action_type = kwargs.get("action_type", "informational")
+    deadline = kwargs.get("deadline")
+    source_file = kwargs.get("source_file", "")
+
+    with _get_conn() as c:
+        cur = c.execute(
+            "INSERT INTO sweet_pea_rudi19.gazelle_case_documents "
+            "(case_id, username, doc_type, title, source, source_file, content_text, "
+            "parsed_summary, action_required, action_type, deadline, status, "
+            "created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
+            (case_id, username, doc_type, title, source, source_file,
+             content_text[:10000], parsed_summary, action_required,
+             action_type, deadline, "unreviewed", now, now)
+        )
+        row = cur.fetchone()
+        doc_id = row[0] if row else None
+
+    return {"doc_id": doc_id, "title": title, "doc_type": doc_type}
+
+
+def update_deadline(deadline_id: int, username: str, status: str,
+                     notes: str = None) -> dict:
+    """Mark a deadline as met, missed, extended, etc."""
+    now = _now()
+    with _get_conn() as c:
+        if notes is not None:
+            c.execute(
+                "UPDATE sweet_pea_rudi19.gazelle_deadlines "
+                "SET status = ?, notes = ?, updated_at = ? "
+                "WHERE id = ? AND username = ?",
+                (status, notes, now, deadline_id, username)
+            )
+        else:
+            c.execute(
+                "UPDATE sweet_pea_rudi19.gazelle_deadlines "
+                "SET status = ?, updated_at = ? WHERE id = ? AND username = ?",
+                (status, now, deadline_id, username)
+            )
+    return {"deadline_id": deadline_id, "status": status}
+
+
+def get_legal_nest_items(username: str) -> list:
+    """Query nest_review_queue for legal-tagged pending items."""
+    with _get_conn() as c:
+        rows = c.execute(
+            "SELECT * FROM sweet_pea_rudi19.nest_review_queue "
+            "WHERE username = ? AND status = 'pending' "
+            "AND (proposed_category ILIKE '%%legal%%' "
+            "     OR proposed_category ILIKE '%%court%%' "
+            "     OR proposed_category ILIKE '%%bankruptcy%%' "
+            "     OR proposed_category ILIKE '%%ecf%%') "
+            "ORDER BY created_at DESC LIMIT 50",
+            (username,)
+        ).fetchall()
+    return [_rd(r) for r in rows]
