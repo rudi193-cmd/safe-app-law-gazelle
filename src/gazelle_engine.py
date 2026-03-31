@@ -1,5 +1,6 @@
 """
 gazelle_engine.py -- Core engine for Law Gazelle (SAFE-framework legal assistant)
+b17: 3L2N9
 
 Full-cycle legal assistant: classify issue, extract facts, look up statutes,
 fill document templates, return ready-to-print HTML.
@@ -17,25 +18,16 @@ if _REPO_ROOT not in sys.path:
 
 from core.db import get_connection
 
-_fleet_loaded = False
-
-def _load_fleet():
-    global _fleet_loaded
-    if _fleet_loaded: return
-    import sys, os
-    p = os.path.normpath("C:/Users/Sean/Documents/GitHub/Willow/core")
-    if p not in sys.path: sys.path.insert(0, p)
-    try:
-        import llm_router as _r; _r.load_keys_from_json(); _fleet_loaded = True
-    except Exception: pass
+import safe_integration as _safe
 
 def _ask_fleet(prompt: str, fallback: str = "") -> str:
-    _load_fleet()
+    """Route LLM requests through Willow's Pigeon bus."""
     try:
-        import llm_router
-        r = llm_router.ask(prompt, preferred_tier="free")
-        if r and r.content: return r.content.strip()
-    except Exception: pass
+        result = _safe.ask(prompt, tier="free")
+        if result and not result.startswith("[Error:"):
+            return result.strip()
+    except Exception:
+        pass
     return fallback
 
 ISSUE_TYPES = {
