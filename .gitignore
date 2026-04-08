@@ -1,6 +1,7 @@
 # Environment / secrets
 .env
 *.env
+credentials.json
 
 # SQLite artifacts (migrated to PostgreSQL)
 *.db
