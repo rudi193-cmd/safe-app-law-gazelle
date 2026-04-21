@@ -3,6 +3,8 @@
   "name": "law-gazelle",
   "version": "1.0.0",
   "safe_version": ">=2.0.0",
+  "b17": "E472A",
+  "agent_type": "tool",
   "description": "Legal reference tool \u2014 statute search, case summaries, plain-language explainers from verified sources.",
   "author": "Sean Campbell",
   "data_streams": [
